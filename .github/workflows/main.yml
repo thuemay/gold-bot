@@ -1,0 +1,42 @@
+name: Gold signal bot
+
+on:
+  schedule:
+    - cron: "2,17,32,47 * * * *"   # mỗi 15 phút (giờ UTC), ngay sau khi nến M15 đóng
+  workflow_dispatch:               # cho phép bấm chạy thử bằng tay
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gold-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cài thư viện
+        run: pip install requests
+
+      - name: Kiểm tra tín hiệu
+        run: python gold_bot.py --once
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          TWELVEDATA_KEY: ${{ secrets.TWELVEDATA_KEY }}
+
+      - name: Lưu trạng thái
+        run: |
+          git config user.name "gold-bot"
+          git config user.email "gold-bot@users.noreply.github.com"
+          git add gold_bot_state.json || true
+          git diff --cached --quiet || (git commit -m "cap nhat trang thai" && git push)
