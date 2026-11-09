@@ -41,6 +41,7 @@ EMA_FAST, EMA_SLOW, EMA_TREND = 21, 50, 200
 USE_HTF = True               # lọc theo xu hướng khung lớn (H4)
 RSI_LEN, RSI_OB, RSI_OS = 14, 70, 30
 ATR_LEN, SL_MULT, TP_MULT = 14, 1.5, 3.0
+HEARTBEAT_MIN = 60           # không có tín hiệu thì cứ 60 phút báo tình hình 1 lần (0 = tắt)
 TF_MIN = 15                  # khung chính: 15 phút
 HTF_MIN = 240                # khung lớn: 4 giờ
 # =================================================================
@@ -397,6 +398,17 @@ def status_text(st, src):
     return "\n".join(lines)
 
 
+def heartbeat_text(st):
+    lines = ["⏱ %s – Chưa có điểm vào mới" % fmt_time(st["t"] + TF_MIN * 60),
+             "Giá: %s | Xu hướng: %s | RSI %.1f" % (fmt(st["close"]), st["trend"], st["rsi"] or 0)]
+    if st["pos"] != 0:
+        lines.append("Lệnh đang mở: %s %s | SL %s | TP %s" % (
+            "MUA" if st["pos"] == 1 else "BÁN", fmt(st["entry"]), fmt(st["sl"]), fmt(st["tp"])))
+    else:
+        lines.append("Không có lệnh – tiếp tục chờ.")
+    return "\n".join(lines)
+
+
 # ------------------------- VÒNG LẶP -------------------------
 def load_state():
     try:
@@ -431,10 +443,23 @@ def run_once(startup=False):
         log(txt.replace("\n", " | "))
         send(txt)
 
+    # Báo định kỳ: mỗi HEARTBEAT_MIN phút gửi 1 tin nếu khoảng đó chưa có tín hiệu nào
+    last_hb = state.get("last_hb")
+    hb = None
+    if HEARTBEAT_MIN > 0:
+        hb = (ltf[-1]["t"] + TF_MIN * 60) // (HEARTBEAT_MIN * 60)
+
     if startup:
         send(status_text(st, src))
+        last_hb = hb
+    elif new:
+        last_hb = hb          # vừa có tín hiệu -> tính lại giờ báo định kỳ
+    elif hb is not None and hb != last_hb:
+        send(heartbeat_text(st))
+        last_hb = hb
+
     log("Đã kiểm tra: giá %s, xu hướng %s, %d sự kiện mới." % (fmt(st["close"]), st["trend"], len(new)))
-    save_state({"last_t": ltf[-1]["t"]})
+    save_state({"last_t": ltf[-1]["t"], "last_hb": last_hb})
 
 
 def main():
