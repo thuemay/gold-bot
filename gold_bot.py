@@ -140,10 +140,20 @@ def get_data():
         ltf = fetch_yahoo("%dm" % TF_MIN, "30d")
         htf = resample(fetch_yahoo("1h", "200d"), HTF_MIN)
         src = "Yahoo GC=F (vàng tương lai)"
-    # Bỏ nến chưa đóng
-    now = time.time()
-    ltf = [b for b in ltf if b["t"] + TF_MIN * 60 <= now]
     return ltf, htf, src
+
+
+def split_closed(raw):
+    """Tách nến đã đóng chắc chắn + giá mới nhất.
+    Nguồn giá trễ (Yahoo trễ ~10 phút) có thể trả nến cuối chưa đủ dữ liệu,
+    nên nến cuối cùng chỉ được tính là đã đóng khi đã qua giờ đóng hơn 2 phút
+    VÀ đã có nến mới hơn phía sau."""
+    now = time.time()
+    live = raw[-1]["c"] if raw else None
+    closed = [b for b in raw if b["t"] + TF_MIN * 60 <= now]
+    if closed and closed[-1] is raw[-1]:
+        closed = closed[:-1]
+    return closed, live
 
 
 # ------------------------- CHỈ BÁO -------------------------
@@ -230,7 +240,7 @@ def simulate(ltf, htf):
             return None, None
         return h_closes[j], h_ema[j]
 
-    pos, entry, sl, tp = 0, None, None, None
+    pos, entry, sl, tp, entry_t = 0, None, None, None, None
     wins = losses = 0
     events = []
     trend = "ĐI NGANG"
@@ -240,17 +250,17 @@ def simulate(ltf, htf):
         if pos == 1:
             if b["l"] <= sl:
                 losses += 1; pos = 0
-                events.append({"type": "LOSS", "side": "MUA", "i": i, "entry": entry, "price": sl})
+                events.append({"type": "LOSS", "side": "MUA", "i": i, "entry": entry, "price": sl, "entry_t": entry_t})
             elif b["h"] >= tp:
                 wins += 1; pos = 0
-                events.append({"type": "WIN", "side": "MUA", "i": i, "entry": entry, "price": tp})
+                events.append({"type": "WIN", "side": "MUA", "i": i, "entry": entry, "price": tp, "entry_t": entry_t})
         elif pos == -1:
             if b["h"] >= sl:
                 losses += 1; pos = 0
-                events.append({"type": "LOSS", "side": "BÁN", "i": i, "entry": entry, "price": sl})
+                events.append({"type": "LOSS", "side": "BÁN", "i": i, "entry": entry, "price": sl, "entry_t": entry_t})
             elif b["l"] <= tp:
                 wins += 1; pos = 0
-                events.append({"type": "WIN", "side": "BÁN", "i": i, "entry": entry, "price": tp})
+                events.append({"type": "WIN", "side": "BÁN", "i": i, "entry": entry, "price": tp, "entry_t": entry_t})
 
         if None in (ef[i], es[i], et[i], r[i], a[i]):
             continue
@@ -270,16 +280,18 @@ def simulate(ltf, htf):
         if buy and pos != 1:
             reversed_ = pos == -1
             pos, entry, sl, tp = 1, c, c - a[i] * SL_MULT, c + a[i] * TP_MULT
+            entry_t = b["t"]
             events.append({"type": "BUY", "i": i, "entry": entry, "sl": sl, "tp": tp,
-                           "rsi": r[i], "rev": reversed_})
+                           "rsi": r[i], "rev": reversed_, "atr": a[i], "entry_t": b["t"]})
         elif sell and pos != -1:
             reversed_ = pos == 1
             pos, entry, sl, tp = -1, c, c + a[i] * SL_MULT, c - a[i] * TP_MULT
+            entry_t = b["t"]
             events.append({"type": "SELL", "i": i, "entry": entry, "sl": sl, "tp": tp,
-                           "rsi": r[i], "rev": reversed_})
+                           "rsi": r[i], "rev": reversed_, "atr": a[i], "entry_t": b["t"]})
 
     last = len(ltf) - 1
-    status = {"pos": pos, "entry": entry, "sl": sl, "tp": tp, "wins": wins, "losses": losses,
+    status = {"pos": pos, "entry_t": entry_t, "entry": entry, "sl": sl, "tp": tp, "wins": wins, "losses": losses,
               "trend": trend, "close": ltf[last]["c"], "rsi": r[last], "atr": a[last],
               "t": ltf[last]["t"]}
     return events, status
@@ -365,15 +377,23 @@ def fmt(x):
     return "%.2f" % x
 
 
-def event_text(e, ltf):
+def event_text(e, ltf, live=None):
     t = fmt_time(ltf[e["i"]]["t"] + TF_MIN * 60)
     if e["type"] in ("BUY", "SELL"):
         side = "🟢 MUA (BUY)" if e["type"] == "BUY" else "🔴 BÁN (SELL)"
         lines = ["%s VÀNG – nến M%d đóng lúc %s" % (side, TF_MIN, t),
-                 "Giá vào: %s" % fmt(e["entry"]),
+                 "Giá vào (giá đóng nến): %s" % fmt(e["entry"]),
                  "SL: %s  (cách %s)" % (fmt(e["sl"]), fmt(abs(e["entry"] - e["sl"]))),
                  "TP: %s  (cách %s)" % (fmt(e["tp"]), fmt(abs(e["tp"] - e["entry"]))),
                  "RSI: %.1f" % e["rsi"]]
+        if live is not None:
+            d = live - e["entry"]
+            lines.append("Giá hiện tại: %s (%s%s so với giá vào)" % (fmt(live), "+" if d >= 0 else "", fmt(d)))
+            chase = d if e["type"] == "BUY" else -d
+            if (e["type"] == "BUY" and live <= e["sl"]) or (e["type"] == "SELL" and live >= e["sl"]):
+                lines.append("⛔ Giá đã vượt SL – BỎ QUA lệnh này.")
+            elif chase > 0.5 * e["atr"]:
+                lines.append("⚠️ Giá đã chạy xa điểm vào – không nên đuổi, chờ giá hồi về gần %s hoặc bỏ qua." % fmt(e["entry"]))
         if e["rev"]:
             lines.append("⚠️ Đảo chiều: đóng lệnh ngược chiều đang mở (nếu có).")
         return "\n".join(lines)
@@ -398,10 +418,11 @@ def status_text(st, src):
     return "\n".join(lines)
 
 
-def heartbeat_text(st):
+def heartbeat_text(st, live=None, show_pos=True):
     lines = ["⏱ %s – Chưa có điểm vào mới" % fmt_time(st["t"] + TF_MIN * 60),
-             "Giá: %s | Xu hướng: %s | RSI %.1f" % (fmt(st["close"]), st["trend"], st["rsi"] or 0)]
-    if st["pos"] != 0:
+             "Giá hiện tại: %s | Xu hướng: %s | RSI %.1f" % (
+                 fmt(live if live is not None else st["close"]), st["trend"], st["rsi"] or 0)]
+    if st["pos"] != 0 and show_pos:
         lines.append("Lệnh đang mở: %s %s | SL %s | TP %s" % (
             "MUA" if st["pos"] == 1 else "BÁN", fmt(st["entry"]), fmt(st["sl"]), fmt(st["tp"])))
     else:
@@ -424,7 +445,8 @@ def save_state(st):
 
 
 def run_once(startup=False):
-    ltf, htf, src = get_data()
+    raw, htf, src = get_data()
+    ltf, live = split_closed(raw)
     if len(ltf) < EMA_TREND + 10:
         log("Chưa đủ dữ liệu (%d nến)." % len(ltf))
         return
@@ -438,10 +460,23 @@ def run_once(startup=False):
     else:
         new = [e for e in events if ltf[e["i"]]["t"] > last_t]
 
+    # Chỉ báo các lệnh đã từng gửi tín hiệu vào lệnh (tránh báo lệnh "ma" do dữ liệu tính lại)
+    sent = set(state.get("sent", []))
+    if last_t is None and st["entry_t"] is not None:
+        sent.add(st["entry_t"])
+    out = []
     for e in new:
-        txt = event_text(e, ltf)
+        if e["type"] in ("BUY", "SELL"):
+            sent.add(e["entry_t"])
+        elif e.get("entry_t") not in sent:
+            continue
+        out.append(e)
+    for e in out:
+        txt = event_text(e, ltf, live)
         log(txt.replace("\n", " | "))
         send(txt)
+    new = out
+    show_pos = st["pos"] != 0 and st["entry_t"] in sent
 
     # Báo định kỳ: mỗi HEARTBEAT_MIN phút gửi 1 tin nếu khoảng đó chưa có tín hiệu nào
     last_hb = state.get("last_hb")
@@ -455,11 +490,11 @@ def run_once(startup=False):
     elif new:
         last_hb = hb          # vừa có tín hiệu -> tính lại giờ báo định kỳ
     elif hb is not None and hb != last_hb:
-        send(heartbeat_text(st))
+        send(heartbeat_text(st, live, show_pos))
         last_hb = hb
 
     log("Đã kiểm tra: giá %s, xu hướng %s, %d sự kiện mới." % (fmt(st["close"]), st["trend"], len(new)))
-    save_state({"last_t": ltf[-1]["t"], "last_hb": last_hb})
+    save_state({"last_t": ltf[-1]["t"], "last_hb": last_hb, "sent": sorted(sent)[-50:]})
 
 
 def main():
