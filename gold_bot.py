@@ -49,6 +49,7 @@ ASIA_END_UTC = 7             # vùng giá phiên Á: 00:00–07:00 UTC (7h–14h
 BO_END_UTC = 16              # chỉ vào lệnh phá vỡ đến 16:00 UTC (23h VN)
 BO_CLOSE_UTC = 20            # lệnh còn mở thì đóng lúc 20:00 UTC (3h sáng VN)
 
+REPORT_HOUR_VN = 7           # mỗi ngày lúc 7h sáng gửi tổng kết lệnh 24h qua (-1 = tắt)
 HEARTBEAT_MIN = 60           # không có tín hiệu thì cứ 60 phút báo tình hình 1 lần (0 = tắt)
 TF_MIN = 15                  # nhịp kiểm tra / khung nhỏ: 15 phút
 # =================================================================
@@ -434,6 +435,46 @@ def startup_text(src, lines):
                       "Mỗi lệnh chỉ nên chịu lỗ tối đa 0,5–1% vốn."] + lines)
 
 
+def trades_summary(st, bars, ev, since):
+    """Liệt kê các lệnh vào từ thời điểm 'since' kèm kết quả."""
+    entries = [e for e in ev if e["type"] in ("BUY", "SELL") and e["entry_t"] >= since]
+    exits = {}
+    for e in ev:
+        if e["type"] in ("WIN", "LOSS", "EOD"):
+            exits.setdefault(e["entry_t"], e)
+    out, tot_pts, tot_r = [], 0.0, 0.0
+    for k, e in enumerate(entries):
+        d = 1 if e["type"] == "BUY" else -1
+        risk = abs(e["entry"] - e["sl"]) or 1
+        x = exits.get(e["entry_t"])
+        # bị đảo chiều bởi lệnh sau trước khi chạm SL/TP
+        nxt = next((n for n in ev if n["type"] in ("BUY", "SELL") and n["entry_t"] > e["entry_t"]), None)
+        if nxt and (x is None or nxt["i"] < x["i"]):
+            x = {"type": "REV", "price": nxt["entry"], "i": nxt["i"]}
+        t_in = fmt_time(e["entry_t"] + st["tf"] * 60)
+        side = "MUA" if d == 1 else "BÁN"
+        if x is None:
+            out.append("  %s %s vào %s – đang mở (SL %s, TP %s)" % (t_in, side, fmt(e["entry"]), fmt(e["sl"]), fmt(e["tp"])))
+            continue
+        pts = (x["price"] - e["entry"]) * d
+        tot_pts += pts; tot_r += pts / risk
+        icon = {"WIN": "✅ TP", "LOSS": "❌ SL", "EOD": "🌙 đóng cuối ngày", "REV": "↩️ đảo chiều"}[x["type"]]
+        out.append("  %s %s vào %s → %s %s: %+.2f giá (%+.1fR)" % (
+            t_in, side, fmt(e["entry"]), icon, fmt(x["price"]), pts, pts / risk))
+    return out, tot_pts, tot_r
+
+
+def report_text(blocks, hours):
+    lines = ["📋 Tổng kết lệnh %d giờ qua" % hours]
+    total = 0.0
+    for name, items, pts, r in blocks:
+        lines.append("• %s:" % name)
+        lines.extend(items if items else ["  không có lệnh"])
+        total += pts
+    lines.append("Tổng lệnh đã đóng: %+.2f giá ≈ %+.2f USD nếu mỗi lệnh 0,01 lot" % (total, total))
+    return "\n".join(lines)
+
+
 def heartbeat_text(t, live, lines):
     return "\n".join(["⏱ %s – Chưa có điểm vào mới" % fmt_time(t),
                       "Giá hiện tại: %s" % fmt(live)] + lines)
@@ -463,6 +504,8 @@ def run_once(startup=False):
     state = load_state()
     new_state = {}
     lines, sent_any, need_startup = [], False, startup
+    report_blocks = []
+    now = time.time()
 
     for st in strategies():
         bars = data[st["src"]][0]
@@ -490,7 +533,9 @@ def run_once(startup=False):
             log(txt.replace("\n", " | "))
             send(txt)
             sent_any = True
-        lines.append(pos_line(st, cur, cur["entry_t"] in sent))
+        lines.append(pos_line(st, cur, cur["pos"] != 0 and cur["entry_t"] in sent))
+        items, pts, r = trades_summary(st, bars, ev, now - 24 * 3600)
+        report_blocks.append((st["name"], items, pts, r))
         new_state[st["key"]] = {"last_t": bars[-1]["t"], "sent": sorted(sent)[-50:]}
 
     # Báo định kỳ
@@ -505,6 +550,15 @@ def run_once(startup=False):
         send(heartbeat_text(m15[-1]["t"] + 15 * 60, live, lines))
         last_hb = hb
 
+    # Tổng kết hằng ngày (và gửi ngay 1 lần khi mới cập nhật tính năng)
+    today_vn = datetime.fromtimestamp(now, VN_TZ)
+    last_rep = state.get("last_report")
+    if REPORT_HOUR_VN >= 0 and report_blocks and (
+            last_rep is None or (today_vn.hour >= REPORT_HOUR_VN and last_rep != today_vn.strftime("%Y-%m-%d"))):
+        send(report_text(report_blocks, 24))
+        last_rep = today_vn.strftime("%Y-%m-%d") if (last_rep is not None or today_vn.hour >= REPORT_HOUR_VN) \
+            else (today_vn - timedelta(days=1)).strftime("%Y-%m-%d")
+    new_state["last_report"] = last_rep
     new_state["last_hb"] = last_hb
     save_state(new_state)
     log("Đã kiểm tra: giá %s | %s" % (fmt(live), " ; ".join(lines)))
