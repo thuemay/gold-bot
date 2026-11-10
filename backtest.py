@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Kiểm tra (backtest) chiến lược tín hiệu vàng trên dữ liệu quá khứ với nhiều bộ thông số.
-Chạy: python backtest.py   -> ghi kết quả ra backtest_result.md
-Dùng lại các hàm chỉ báo trong gold_bot.py.
+Backtest v2 – tìm chiến lược giao dịch HẰNG NGÀY cho vàng.
+Thử 4 kiểu chiến lược x 3 khung (M15, M30, H1) x nhiều mức SL/TP.
+Chạy: python backtest.py -> ghi kết quả ra backtest_result.md
 """
 import bisect
 import itertools
@@ -58,135 +58,208 @@ def load_data():
     return data, src
 
 
-# ---------------------------- MÔ PHỎNG ----------------------------
-def prepare(ltf, htf):
-    closes = [b["c"] for b in ltf]
-    ind = {
-        "ef": g.ema(closes, 21), "es": g.ema(closes, 50), "et": g.ema(closes, 200),
-        "rsi": g.rsi(closes, 14), "atr": g.atr(ltf, 14),
-    }
-    ind["m"], ind["s"] = g.macd(closes)
-    h_closes = [b["c"] for b in htf]
-    h_ema = g.ema(h_closes, 200)
-    h_starts = [b["t"] for b in htf]
-    hu, hd = [], []
-    for b in ltf:
-        j = bisect.bisect_right(h_starts, b["t"]) - 2
-        if j < 0 or h_ema[j] is None:
-            hu.append(None); hd.append(None)
-        else:
-            hu.append(h_closes[j] > h_ema[j]); hd.append(h_closes[j] < h_ema[j])
-    ind["hu"], ind["hd"] = hu, hd
+MIN_PER_WEEK = 4.0
+
+
+# ---------------------------- CHỈ BÁO PHỤ ----------------------------
+def sma(vals, n):
+    out = [None] * len(vals)
+    s = 0.0
+    for i, v in enumerate(vals):
+        s += v
+        if i >= n:
+            s -= vals[i - n]
+        if i >= n - 1:
+            out[i] = s / n
+    return out
+
+
+def stdev(vals, n, mean):
+    out = [None] * len(vals)
+    for i in range(n - 1, len(vals)):
+        m = mean[i]
+        out[i] = (sum((x - m) ** 2 for x in vals[i - n + 1:i + 1]) / n) ** 0.5
+    return out
+
+
+def base_ind(b):
+    c = [x["c"] for x in b]
+    ind = {"c": c, "e21": g.ema(c, 21), "e50": g.ema(c, 50), "e200": g.ema(c, 200),
+           "rsi": g.rsi(c, 14), "atr": g.atr(b, 14)}
+    ind["m"], ind["s"] = g.macd(c)
+    mid = sma(c, 20)
+    sd = stdev(c, 20, mid)
+    ind["bbu"] = [None if mid[i] is None else mid[i] + 2 * sd[i] for i in range(len(c))]
+    ind["bbl"] = [None if mid[i] is None else mid[i] - 2 * sd[i] for i in range(len(c))]
+    ind["bbm"] = mid
     return ind
 
 
-def run(ltf, ind, p, start, end):
-    """Trả về danh sách kết quả từng lệnh tính theo R (1R = khoảng cách SL)."""
-    ef, es, et, r, a, m, s = ind["ef"], ind["es"], ind["et"], ind["rsi"], ind["atr"], ind["m"], ind["s"]
-    trades = []
+def ok(*xs):
+    return all(x is not None for x in xs)
+
+
+# ---------------------------- CÁC KIỂU TÍN HIỆU ----------------------------
+def sig_macd(b, d, i):
+    """Theo xu hướng: EMA21>50, giá > EMA200, MACD cắt lên, RSI 50-70 (bản gốc, bỏ lọc H4)."""
+    if not ok(d["e21"][i], d["e50"][i], d["e200"][i], d["m"][i], d["s"][i], d["m"][i-1], d["s"][i-1], d["rsi"][i]):
+        return 0
+    c = b[i]["c"]
+    if c > d["e200"][i] and d["e21"][i] > d["e50"][i] and d["m"][i] > d["s"][i] and d["m"][i-1] <= d["s"][i-1] and 50 < d["rsi"][i] < 70:
+        return 1
+    if c < d["e200"][i] and d["e21"][i] < d["e50"][i] and d["m"][i] < d["s"][i] and d["m"][i-1] >= d["s"][i-1] and 30 < d["rsi"][i] < 50:
+        return -1
+    return 0
+
+
+def sig_pullback(b, d, i):
+    """Xu hướng tăng (EMA50>EMA200), giá hồi chạm EMA21 rồi đóng nến tăng trên EMA21 -> MUA."""
+    if not ok(d["e21"][i], d["e50"][i], d["e200"][i]):
+        return 0
+    x = b[i]
+    if d["e50"][i] > d["e200"][i] and x["c"] > d["e200"][i] and x["l"] <= d["e21"][i] < x["c"] and x["c"] > x["o"]:
+        return 1
+    if d["e50"][i] < d["e200"][i] and x["c"] < d["e200"][i] and x["h"] >= d["e21"][i] > x["c"] and x["c"] < x["o"]:
+        return -1
+    return 0
+
+
+def sig_meanrev(b, d, i):
+    """Đảo chiều: giá thủng dải Bollinger dưới với RSI thấp rồi đóng cửa quay lại trong dải -> MUA."""
+    if not ok(d["bbl"][i], d["bbl"][i-1], d["rsi"][i-1]):
+        return 0
+    if b[i-1]["c"] < d["bbl"][i-1] and b[i]["c"] > d["bbl"][i] and d["rsi"][i-1] < 30:
+        return 1
+    if b[i-1]["c"] > d["bbu"][i-1] and b[i]["c"] < d["bbu"][i] and d["rsi"][i-1] > 70:
+        return -1
+    return 0
+
+
+def make_breakout(bars):
+    """Phá vỡ vùng giá phiên Á (00:00-07:00 UTC = 7h-14h VN) trong phiên Âu/Mỹ (07:00-16:00 UTC)."""
+    day_hi, day_lo, traded = {}, {}, set()
+    for x in bars:
+        dt = datetime.fromtimestamp(x["t"], timezone.utc)
+        if dt.hour < 7:
+            k = dt.date()
+            day_hi[k] = max(day_hi.get(k, x["h"]), x["h"])
+            day_lo[k] = min(day_lo.get(k, x["l"]), x["l"])
+
+    def sig(b, d, i):
+        dt = datetime.fromtimestamp(b[i]["t"], timezone.utc)
+        k = dt.date()
+        if not (7 <= dt.hour < 16) or k not in day_hi or k in traded:
+            return 0
+        if b[i]["c"] > day_hi[k]:
+            traded.add(k); return 1
+        if b[i]["c"] < day_lo[k]:
+            traded.add(k); return -1
+        return 0
+    return sig, traded
+
+
+# ---------------------------- MÔ PHỎNG ----------------------------
+def run(b, d, sigs, p, start, end, eod=False):
+    a = d["atr"]
+    tr = []
     pos, entry, sl, tp, risk = 0, 0, 0, 0, 1
     for i in range(max(start, 1), end):
-        b = ltf[i]
+        x = b[i]
         if pos == 1:
-            if b["l"] <= sl:
-                trades.append(-1 - SPREAD / risk); pos = 0
-            elif b["h"] >= tp:
-                trades.append((tp - entry - SPREAD) / risk); pos = 0
+            if x["l"] <= sl:
+                tr.append(-1 - SPREAD / risk); pos = 0
+            elif x["h"] >= tp:
+                tr.append((tp - entry - SPREAD) / risk); pos = 0
         elif pos == -1:
-            if b["h"] >= sl:
-                trades.append(-1 - SPREAD / risk); pos = 0
-            elif b["l"] <= tp:
-                trades.append((entry - tp - SPREAD) / risk); pos = 0
-        if None in (ef[i], es[i], et[i], r[i], a[i], m[i], s[i], m[i - 1], s[i - 1]):
+            if x["h"] >= sl:
+                tr.append(-1 - SPREAD / risk); pos = 0
+            elif x["l"] <= tp:
+                tr.append((entry - tp - SPREAD) / risk); pos = 0
+        if pos and eod and datetime.fromtimestamp(x["t"], timezone.utc).hour >= 20:
+            tr.append(((x["c"] - entry) * pos - SPREAD) / risk); pos = 0
+        sgn = sigs[i]
+        if sgn == 0 or a[i] is None or sgn == pos:
             continue
-        if p["htf"] and ind["hu"][i] is None:
-            continue
-        c = b["c"]
-        up = c > et[i] and ef[i] > es[i] and (not p["htf"] or ind["hu"][i])
-        dn = c < et[i] and ef[i] < es[i] and (not p["htf"] or ind["hd"][i])
-        xu = m[i] > s[i] and m[i - 1] <= s[i - 1]
-        xd = m[i] < s[i] and m[i - 1] >= s[i - 1]
-        rsi_ok_b = (50 < r[i] < 70) if p["rsi"] else True
-        rsi_ok_s = (30 < r[i] < 50) if p["rsi"] else True
-        buy = up and xu and rsi_ok_b
-        sell = dn and xd and rsi_ok_s
-        if buy and pos != 1:
-            if pos == -1:
-                trades.append((entry - c - SPREAD) / risk)
-            risk = a[i] * p["sl"]
-            pos, entry, sl, tp = 1, c, c - risk, c + a[i] * p["tp"]
-        elif sell and pos != -1:
-            if pos == 1:
-                trades.append((c - entry - SPREAD) / risk)
-            risk = a[i] * p["sl"]
-            pos, entry, sl, tp = -1, c, c + risk, c - a[i] * p["tp"]
-    return trades
+        if pos:
+            tr.append(((x["c"] - entry) * pos - SPREAD) / risk)
+        risk = a[i] * p["sl"]
+        pos, entry = sgn, x["c"]
+        sl = entry - sgn * risk
+        tp = entry + sgn * a[i] * p["tp"]
+    return tr
 
 
 def stats(tr):
     n = len(tr)
-    if n == 0:
-        return {"n": 0, "wr": 0, "R": 0, "pf": 0, "dd": 0}
-    wins = [x for x in tr if x > 0]
-    loss = [x for x in tr if x <= 0]
-    eq = peak = dd = 0
+    if not n:
+        return {"n": 0, "wr": 0, "R": 0, "pf": 0, "dd": 0, "streak": 0}
+    w = [x for x in tr if x > 0]
+    l = [x for x in tr if x <= 0]
+    eq = pk = dd = 0
+    st = mx = 0
     for x in tr:
-        eq += x; peak = max(peak, eq); dd = max(dd, peak - eq)
-    pf = sum(wins) / -sum(loss) if loss and sum(loss) < 0 else 99
-    return {"n": n, "wr": 100.0 * len(wins) / n, "R": sum(tr), "pf": pf, "dd": dd}
+        eq += x; pk = max(pk, eq); dd = max(dd, pk - eq)
+        st = st + 1 if x <= 0 else 0
+        mx = max(mx, st)
+    pf = sum(w) / -sum(l) if l and sum(l) < 0 else 99
+    return {"n": n, "wr": 100.0 * len(w) / n, "R": sum(tr), "pf": pf, "dd": dd, "streak": mx}
 
 
-# ---------------------------- CHẠY ----------------------------
 def main():
     data, src = load_data()
-    grid = {"sl": [1.0, 1.5, 2.0], "tp": [1.5, 2.0, 3.0, 4.0], "htf": [True, False], "rsi": [True, False]}
-    combos = [dict(zip(grid, v)) for v in itertools.product(*grid.values())]
-
-    rows = []
-    info = []
-    for tf, htf_name in (("M15", "H4"), ("H1", "D1")):
-        ltf, htf = data[tf], data[htf_name]
-        if len(ltf) < 400:
+    frames = {"M15": data["M15"], "M30": g.resample(data["M15"], 30), "H1": data["H1"]}
+    grid = [{"sl": s, "tp": t} for s, t in itertools.product([1.0, 1.5, 2.0], [1.0, 1.5, 2.0, 3.0])]
+    rows, info = [], []
+    for tf, b in frames.items():
+        if len(b) < 500:
             continue
-        ind = prepare(ltf, htf)
-        cut = int(len(ltf) * SPLIT)
-        d0 = datetime.fromtimestamp(ltf[0]["t"], timezone.utc).strftime("%d/%m/%Y")
-        dc = datetime.fromtimestamp(ltf[cut]["t"], timezone.utc).strftime("%d/%m/%Y")
-        d1 = datetime.fromtimestamp(ltf[-1]["t"], timezone.utc).strftime("%d/%m/%Y")
-        info.append("- %s (lọc xu hướng khung %s): %d nến, %s → %s; kiểm chứng từ %s" % (tf, htf_name, len(ltf), d0, d1, dc))
-        for p in combos:
-            a = stats(run(ltf, ind, p, 200, cut))
-            b = stats(run(ltf, ind, p, cut, len(ltf)))
-            full = stats(run(ltf, ind, p, 200, len(ltf)))
-            rows.append((tf, p, a, b, full))
+        d = base_ind(b)
+        cut = int(len(b) * SPLIT)
+        weeks = (b[-1]["t"] - b[200]["t"]) / (7 * 86400.0)
+        info.append("- %s: %d nến, %s → %s (%.0f tuần), kiểm chứng từ %s" % (
+            tf, len(b), datetime.fromtimestamp(b[0]["t"], timezone.utc).strftime("%d/%m/%Y"),
+            datetime.fromtimestamp(b[-1]["t"], timezone.utc).strftime("%d/%m/%Y"), weeks,
+            datetime.fromtimestamp(b[cut]["t"], timezone.utc).strftime("%d/%m/%Y")))
+        strategies = {"Theo xu hướng MACD": (sig_macd, False),
+                      "Hồi về EMA21": (sig_pullback, False),
+                      "Đảo chiều Bollinger": (sig_meanrev, False)}
+        if tf != "H1":
+            strategies["Phá vỡ phiên Á"] = (None, True)
+        for name, (fn, eod) in strategies.items():
+            if fn is None:
+                fn, _ = make_breakout(b)
+            sigs = [0] + [fn(b, d, i) for i in range(1, len(b))]
+            for p in grid:
+                full = stats(run(b, d, sigs, p, 200, len(b), eod))
+                lrn = stats(run(b, d, sigs, p, 200, cut, eod))
+                tst = stats(run(b, d, sigs, p, cut, len(b), eod))
+                rows.append({"tf": tf, "name": name, "p": p, "full": full, "lrn": lrn, "tst": tst,
+                             "pw": full["n"] / weeks})
 
-    def name(tf, p):
-        return "%s SL%.1f TP%.1f %s %s" % (tf, p["sl"], p["tp"], "H-TF" if p["htf"] else "noHTF",
-                                         "RSI" if p["rsi"] else "noRSI")
-
-    out = ["# Kết quả backtest chiến lược vàng", "",
-           "Chạy lúc: %s UTC" % datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M"),
-           "Nguồn: %s | chi phí mỗi lệnh: %.2f USD" % (src, SPREAD), ""] + info + ["",
-           "R = lời/lỗ tính theo số lần rủi ro (1R = khoảng cách SL). PF = tổng lời / tổng lỗ. DD = sụt giảm lớn nhất (R).", ""]
+    out = ["# Backtest v2 – chiến lược giao dịch hằng ngày", "",
+           "Chạy lúc %s UTC | Nguồn: %s | chi phí %.2f USD/lệnh" % (
+               datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M"), src, SPREAD), ""] + info + [""]
 
     def table(title, items):
-        out.append("## " + title)
-        out.append("")
-        out.append("| Bộ thông số | Học: lệnh / thắng% / R | Kiểm chứng: lệnh / thắng% / R / PF | Toàn bộ: R / DD |")
-        out.append("|---|---|---|---|")
-        for tf, p, a, b, f in items:
-            out.append("| %s | %d / %.0f%% / %+.1f | %d / %.0f%% / %+.1f / %.2f | %+.1f / %.1f |" % (
-                name(tf, p), a["n"], a["wr"], a["R"], b["n"], b["wr"], b["R"], b["pf"], f["R"], f["dd"]))
+        out.extend(["## " + title, "",
+                    "| Chiến lược | Khung | SL/TP (xATR) | Lệnh/tuần | Học: thắng% / R | Kiểm chứng: lệnh / thắng% / R / PF | Toàn bộ R | DD | Thua liền max |",
+                    "|---|---|---|---|---|---|---|---|---|"])
+        for r in items:
+            f, l, t = r["full"], r["lrn"], r["tst"]
+            out.append("| %s | %s | %.1f / %.1f | %.1f | %.0f%% / %+.1f | %d / %.0f%% / %+.1f / %.2f | %+.1f | %.1f | %d |" % (
+                r["name"], r["tf"], r["p"]["sl"], r["p"]["tp"], r["pw"], l["wr"], l["R"],
+                t["n"], t["wr"], t["R"], t["pf"], f["R"], f["dd"], f["streak"]))
         out.append("")
 
-    current = [x for x in rows if x[0] == "M15" and x[1] == {"sl": 1.5, "tp": 3.0, "htf": True, "rsi": True}]
-    table("Bộ thông số đang dùng", current)
-    # Chọn theo giai đoạn học (có đủ lệnh), xem kết quả ở giai đoạn kiểm chứng
-    ranked = sorted([x for x in rows if x[2]["n"] >= 20], key=lambda x: x[2]["R"], reverse=True)
-    table("Top 12 bộ tốt nhất ở giai đoạn HỌC (xem có giữ được ở giai đoạn kiểm chứng không)", ranked[:12])
-    both = sorted([x for x in rows if x[2]["n"] >= 20 and x[3]["n"] >= 8 and x[2]["R"] > 0 and x[3]["R"] > 0],
-                  key=lambda x: min(x[2]["R"] / max(x[2]["n"], 1), x[3]["R"] / max(x[3]["n"], 1)), reverse=True)
-    table("Các bộ có lãi ở CẢ HAI giai đoạn (ổn định hơn)", both[:12])
+    daily = [r for r in rows if r["pw"] >= MIN_PER_WEEK]
+    good = sorted([r for r in daily if r["lrn"]["R"] > 0 and r["tst"]["R"] > 0],
+                  key=lambda r: r["tst"]["pf"], reverse=True)
+    table("Có lãi ở CẢ HAI giai đoạn và >= %.0f lệnh/tuần" % MIN_PER_WEEK, good[:15])
+    best_each = {}
+    for r in sorted(daily, key=lambda r: r["full"]["R"], reverse=True):
+        best_each.setdefault((r["name"], r["tf"]), r)
+    table("Bộ tốt nhất của từng chiến lược/khung (>= %.0f lệnh/tuần)" % MIN_PER_WEEK,
+          sorted(best_each.values(), key=lambda r: r["full"]["R"], reverse=True))
 
     with open("backtest_result.md", "w", encoding="utf-8") as f:
         f.write("\n".join(out))
